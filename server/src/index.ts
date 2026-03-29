@@ -3,11 +3,23 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 
-import type { CreateGameData, Game, JoinGameData, Player, Question, RegData, User, WSMessage } from './types';
+import type {
+  AnswerData,
+  CreateGameData,
+  Game,
+  JoinGameData,
+  Player,
+  Question,
+  RegData,
+  StartGameData,
+  User,
+  WSMessage,
+} from './types';
 
 const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
 const ROOM_CODE_LENGTH = 6;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const BASE_POINTS = 1000;
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -18,12 +30,16 @@ const socketByUserId = new Map<string, WebSocket>();
 const gamesById = new Map<string, Game>();
 const gameIdByCode = new Map<string, string>();
 const gameIdByUserId = new Map<string, string>();
+const finalizedQuestionKeys = new Set<string>();
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === 'string' && value.trim().length > 0;
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
 
 const send = (ws: WebSocket, type: string, data: unknown): void => {
   if (ws.readyState !== WebSocket.OPEN) {
@@ -109,6 +125,72 @@ const parseIncomingMessage = (rawData: RawData): WSMessage | null => {
   } catch {
     return null;
   }
+};
+
+const makeQuestionKey = (gameId: string, questionIndex: number): string =>
+  `${gameId}:${questionIndex}`;
+
+const allPlayersAnswered = (game: Game): boolean =>
+  game.players.length > 0 && game.playerAnswers.size >= game.players.length;
+
+const finalizeQuestion = (gameId: string, questionIndex: number): void => {
+  const game = gamesById.get(gameId);
+  if (!game || game.status !== 'in_progress') {
+    return;
+  }
+
+  if (game.currentQuestion !== questionIndex) {
+    return;
+  }
+
+  const key = makeQuestionKey(gameId, questionIndex);
+  if (finalizedQuestionKeys.has(key)) {
+    return;
+  }
+  finalizedQuestionKeys.add(key);
+
+  if (game.questionTimer) {
+    clearTimeout(game.questionTimer);
+    game.questionTimer = undefined;
+  }
+
+  const question = game.questions[questionIndex];
+  if (!question) {
+    return;
+  }
+
+  const questionStart = game.questionStartTime ?? Date.now();
+  const questionDurationMs = question.timeLimitSec * 1000;
+
+  const playerResults = game.players.map((player) => {
+    const answer = game.playerAnswers.get(player.index);
+    const answered = Boolean(answer);
+    const correct = answered && answer?.answerIndex === question.correctIndex;
+
+    let pointsEarned = 0;
+    if (answer && correct) {
+      const elapsedMs = Math.max(0, answer.timestamp - questionStart);
+      const remainingMs = Math.max(0, questionDurationMs - elapsedMs);
+      const rawScore = BASE_POINTS * (remainingMs / questionDurationMs);
+      pointsEarned = clamp(Math.round(rawScore), 0, BASE_POINTS);
+    }
+
+    player.score += pointsEarned;
+
+    return {
+      name: player.name,
+      answered,
+      correct,
+      pointsEarned,
+      totalScore: player.score,
+    };
+  });
+
+  broadcast(game, 'question_result', {
+    questionIndex,
+    correctIndex: question.correctIndex,
+    playerResults,
+  });
 };
 
 const generateRoomCode = (): string => {
@@ -353,6 +435,7 @@ const handleJoinGame = (ws: WebSocket, data: unknown): void => {
   const existingPlayer = game.players.find((player) => player.index === user.index);
   if (existingPlayer) {
     existingPlayer.ws = ws;
+    gameIdByUserId.set(user.index, game.id);
     send(ws, 'game_joined', {
       gameId: game.id,
     });
@@ -381,12 +464,152 @@ const handleJoinGame = (ws: WebSocket, data: unknown): void => {
   broadcastPlayers(game);
 };
 
-const handleStartGame = (ws: WebSocket): void => {
-  sendError(ws, 'start_game handler is not implemented yet.');
+const handleStartGame = (ws: WebSocket, data: unknown): void => {
+  const user = getUserBySocket(ws);
+  if (!user) {
+    sendError(ws, 'Please register/login first.');
+    return;
+  }
+
+  if (!isRecord(data)) {
+    sendError(ws, 'Invalid start_game payload.');
+    return;
+  }
+
+  const payload = data as Partial<StartGameData>;
+  const gameId = isNonEmptyString(payload.gameId) ? payload.gameId.trim() : '';
+  if (!gameId) {
+    sendError(ws, 'gameId is required.');
+    return;
+  }
+
+  const game = gamesById.get(gameId);
+  if (!game) {
+    sendError(ws, 'Game not found.');
+    return;
+  }
+
+  if (game.hostId !== user.index) {
+    sendError(ws, 'Only host can start the game.');
+    return;
+  }
+
+  if (game.status !== 'waiting') {
+    sendError(ws, 'Game is not in waiting status.');
+    return;
+  }
+
+  if (game.questions.length === 0) {
+    sendError(ws, 'Game has no questions.');
+    return;
+  }
+
+  if (game.players.length === 0) {
+    sendError(ws, 'At least one player must join before starting.');
+    return;
+  }
+
+  game.status = 'in_progress';
+  game.currentQuestion = 0;
+  game.playerAnswers.clear();
+  game.questionStartTime = Date.now();
+
+  const questionKey = makeQuestionKey(game.id, 0);
+  finalizedQuestionKeys.delete(questionKey);
+
+  if (game.questionTimer) {
+    clearTimeout(game.questionTimer);
+    game.questionTimer = undefined;
+  }
+
+  const firstQuestion = game.questions[0];
+  game.questionTimer = setTimeout(() => {
+    finalizeQuestion(game.id, 0);
+  }, firstQuestion.timeLimitSec * 1000);
+
+  broadcast(game, 'question', {
+    questionNumber: 1,
+    totalQuestions: game.questions.length,
+    text: firstQuestion.text,
+    options: firstQuestion.options,
+    timeLimitSec: firstQuestion.timeLimitSec,
+  });
 };
 
-const handleAnswer = (ws: WebSocket): void => {
-  sendError(ws, 'answer handler is not implemented yet.');
+const handleAnswer = (ws: WebSocket, data: unknown): void => {
+  const user = getUserBySocket(ws);
+  if (!user) {
+    sendError(ws, 'Please register/login first.');
+    return;
+  }
+
+  if (!isRecord(data)) {
+    sendError(ws, 'Invalid answer payload.');
+    return;
+  }
+
+  const payload = data as Partial<AnswerData>;
+  const gameId = isNonEmptyString(payload.gameId) ? payload.gameId.trim() : '';
+  if (!gameId) {
+    sendError(ws, 'gameId is required.');
+    return;
+  }
+
+  if (!Number.isInteger(payload.questionIndex) || payload.questionIndex < 0) {
+    sendError(ws, 'Invalid questionIndex.');
+    return;
+  }
+
+  if (!Number.isInteger(payload.answerIndex) || payload.answerIndex < 0 || payload.answerIndex > 3) {
+    sendError(ws, 'Invalid answerIndex.');
+    return;
+  }
+
+  const game = gamesById.get(gameId);
+  if (!game) {
+    sendError(ws, 'Game not found.');
+    return;
+  }
+
+  if (game.status !== 'in_progress') {
+    sendError(ws, 'Game is not in progress.');
+    return;
+  }
+
+  if (game.currentQuestion !== payload.questionIndex) {
+    sendError(ws, 'Answer is for a non-current question.');
+    return;
+  }
+
+  const player = game.players.find((item) => item.index === user.index);
+  if (!player) {
+    sendError(ws, 'Only joined players can submit answers.');
+    return;
+  }
+
+  const questionKey = makeQuestionKey(game.id, payload.questionIndex);
+  if (finalizedQuestionKeys.has(questionKey)) {
+    sendError(ws, 'Question is already finalized.');
+    return;
+  }
+
+  if (game.playerAnswers.has(user.index)) {
+    sendError(ws, 'Answer already submitted for this question.');
+    return;
+  }
+
+  game.playerAnswers.set(user.index, {
+    answerIndex: payload.answerIndex,
+    timestamp: Date.now(),
+  });
+
+  send(ws, 'answer_accepted', {
+    questionIndex: payload.questionIndex,
+  });
+
+  if (allPlayersAnswered(game)) {
+    finalizeQuestion(game.id, game.currentQuestion);
+  }
 };
 
 const unlinkSocket = (ws: WebSocket): void => {
@@ -426,10 +649,10 @@ wss.on('connection', (ws) => {
         handleJoinGame(ws, message.data);
         break;
       case 'start_game':
-        handleStartGame(ws);
+        handleStartGame(ws, message.data);
         break;
       case 'answer':
-        handleAnswer(ws);
+        handleAnswer(ws, message.data);
         break;
       default:
         sendError(ws, `Unknown message type: ${message.type}`);
