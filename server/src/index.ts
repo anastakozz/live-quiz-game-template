@@ -708,6 +708,48 @@ const unlinkSocket = (ws: WebSocket): void => {
   if (user?.ws === ws) {
     user.ws = undefined;
   }
+
+  const gameId = gameIdByUserId.get(userId);
+  if (!gameId) {
+    return;
+  }
+
+  const game = gamesById.get(gameId);
+  if (!game) {
+    gameIdByUserId.delete(userId);
+    return;
+  }
+
+  if (game.hostId === userId) {
+    if (game.status === 'waiting') {
+      broadcast(game, 'error', {
+        message: 'Host disconnected. Game has been closed.',
+      });
+      cleanupGame(game.id);
+    }
+    return;
+  }
+
+  const playerIndex = game.players.findIndex((player) => player.index === userId);
+  if (playerIndex === -1) {
+    if (gameIdByUserId.get(userId) === game.id) {
+      gameIdByUserId.delete(userId);
+    }
+    return;
+  }
+
+  game.players.splice(playerIndex, 1);
+  game.playerAnswers.delete(userId);
+
+  if (gameIdByUserId.get(userId) === game.id) {
+    gameIdByUserId.delete(userId);
+  }
+
+  broadcastPlayers(game);
+
+  if (game.status === 'in_progress' && allPlayersAnswered(game)) {
+    finalizeQuestion(game.id, game.currentQuestion);
+  }
 };
 
 wss.on('connection', (ws) => {
@@ -740,6 +782,10 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    unlinkSocket(ws);
+  });
+
+  ws.on('error', () => {
     unlinkSocket(ws);
   });
 });
