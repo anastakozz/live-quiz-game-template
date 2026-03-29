@@ -3,9 +3,11 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 
-import type { Game, RegData, User, WSMessage } from './types';
+import type { CreateGameData, Game, JoinGameData, Player, Question, RegData, User, WSMessage } from './types';
 
 const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
+const ROOM_CODE_LENGTH = 6;
+const ROOM_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -46,6 +48,15 @@ const sendRegResponse = (
   data: { name: string; index: string; error: boolean; errorText: string },
 ): void => {
   send(ws, 'reg', data);
+};
+
+const getUserBySocket = (ws: WebSocket): User | null => {
+  const userId = userIdBySocket.get(ws);
+  if (!userId) {
+    return null;
+  }
+
+  return usersById.get(userId) ?? null;
 };
 
 const broadcast = (game: Game, type: string, data: unknown): void => {
@@ -98,6 +109,80 @@ const parseIncomingMessage = (rawData: RawData): WSMessage | null => {
   } catch {
     return null;
   }
+};
+
+const generateRoomCode = (): string => {
+  let code = '';
+
+  do {
+    code = '';
+    for (let i = 0; i < ROOM_CODE_LENGTH; i += 1) {
+      const index = Math.floor(Math.random() * ROOM_CODE_ALPHABET.length);
+      code += ROOM_CODE_ALPHABET[index];
+    }
+  } while (gameIdByCode.has(code));
+
+  return code;
+};
+
+const sanitizeQuestion = (candidate: unknown): Question | null => {
+  if (!isRecord(candidate)) {
+    return null;
+  }
+
+  const { text, options, correctIndex, timeLimitSec } = candidate;
+
+  if (!isNonEmptyString(text)) {
+    return null;
+  }
+
+  if (!Array.isArray(options) || options.length !== 4) {
+    return null;
+  }
+
+  const normalizedOptions = options.map((option) =>
+    typeof option === 'string' ? option.trim() : '',
+  );
+  if (normalizedOptions.some((option) => option.length === 0)) {
+    return null;
+  }
+
+  if (typeof correctIndex !== 'number' || !Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex > 3) {
+    return null;
+  }
+
+  if (typeof timeLimitSec !== 'number' || !Number.isFinite(timeLimitSec) || timeLimitSec <= 0) {
+    return null;
+  }
+
+  return {
+    text: text.trim(),
+    options: normalizedOptions,
+    correctIndex,
+    timeLimitSec,
+  };
+};
+
+const sanitizeQuestions = (data: unknown): Question[] | null => {
+  if (!isRecord(data)) {
+    return null;
+  }
+
+  const payload = data as Partial<CreateGameData>;
+  if (!Array.isArray(payload.questions) || payload.questions.length === 0) {
+    return null;
+  }
+
+  const result: Question[] = [];
+  for (const question of payload.questions) {
+    const normalized = sanitizeQuestion(question);
+    if (!normalized) {
+      return null;
+    }
+    result.push(normalized);
+  }
+
+  return result;
 };
 
 const bindUserToSocket = (user: User, ws: WebSocket): void => {
@@ -178,12 +263,122 @@ const handleReg = (ws: WebSocket, data: unknown): void => {
   });
 };
 
-const handleCreateGame = (ws: WebSocket): void => {
-  sendError(ws, 'create_game handler is not implemented yet.');
+const handleCreateGame = (ws: WebSocket, data: unknown): void => {
+  const user = getUserBySocket(ws);
+  if (!user) {
+    sendError(ws, 'Please register/login first.');
+    return;
+  }
+
+  const existingGameId = gameIdByUserId.get(user.index);
+  if (existingGameId && gamesById.has(existingGameId)) {
+    sendError(ws, 'User is already in an active game.');
+    return;
+  }
+
+  const questions = sanitizeQuestions(data);
+  if (!questions) {
+    sendError(ws, 'Invalid questions payload.');
+    return;
+  }
+
+  const game: Game = {
+    id: randomUUID(),
+    code: generateRoomCode(),
+    hostId: user.index,
+    questions,
+    players: [],
+    currentQuestion: -1,
+    status: 'waiting',
+    playerAnswers: new Map(),
+  };
+
+  gamesById.set(game.id, game);
+  gameIdByCode.set(game.code, game.id);
+  gameIdByUserId.set(user.index, game.id);
+
+  send(ws, 'game_created', {
+    gameId: game.id,
+    code: game.code,
+  });
 };
 
-const handleJoinGame = (ws: WebSocket): void => {
-  sendError(ws, 'join_game handler is not implemented yet.');
+const handleJoinGame = (ws: WebSocket, data: unknown): void => {
+  const user = getUserBySocket(ws);
+  if (!user) {
+    sendError(ws, 'Please register/login first.');
+    return;
+  }
+
+  if (!isRecord(data)) {
+    sendError(ws, 'Invalid join_game payload.');
+    return;
+  }
+
+  const payload = data as Partial<JoinGameData>;
+  const normalizedCode = isNonEmptyString(payload.code) ? payload.code.trim().toUpperCase() : '';
+  if (!normalizedCode) {
+    sendError(ws, 'Room code is required.');
+    return;
+  }
+
+  const gameId = gameIdByCode.get(normalizedCode);
+  if (!gameId) {
+    sendError(ws, 'Game not found for this room code.');
+    return;
+  }
+
+  const game = gamesById.get(gameId);
+  if (!game) {
+    sendError(ws, 'Game not found.');
+    return;
+  }
+
+  if (game.status !== 'waiting') {
+    sendError(ws, 'Game has already started or finished.');
+    return;
+  }
+
+  if (game.hostId === user.index) {
+    sendError(ws, 'Host cannot join their own game as player.');
+    return;
+  }
+
+  const existingGameId = gameIdByUserId.get(user.index);
+  if (existingGameId && existingGameId !== game.id && gamesById.has(existingGameId)) {
+    sendError(ws, 'User is already in an active game.');
+    return;
+  }
+
+  const existingPlayer = game.players.find((player) => player.index === user.index);
+  if (existingPlayer) {
+    existingPlayer.ws = ws;
+    send(ws, 'game_joined', {
+      gameId: game.id,
+    });
+    return;
+  }
+
+  const player: Player = {
+    name: user.name,
+    index: user.index,
+    score: 0,
+    ws,
+  };
+
+  game.players.push(player);
+  gameIdByUserId.set(user.index, game.id);
+
+  send(ws, 'game_joined', {
+    gameId: game.id,
+  });
+
+  broadcast(game, 'player_joined', {
+    playerName: player.name,
+    playerCount: game.players.length,
+  });
+
+  broadcastPlayers(game);
 };
 
 const handleStartGame = (ws: WebSocket): void => {
@@ -225,10 +420,10 @@ wss.on('connection', (ws) => {
         handleReg(ws, message.data);
         break;
       case 'create_game':
-        handleCreateGame(ws);
+        handleCreateGame(ws, message.data);
         break;
       case 'join_game':
-        handleJoinGame(ws);
+        handleJoinGame(ws, message.data);
         break;
       case 'start_game':
         handleStartGame(ws);
