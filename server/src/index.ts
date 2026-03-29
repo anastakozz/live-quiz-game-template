@@ -20,6 +20,7 @@ const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
 const ROOM_CODE_LENGTH = 6;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const BASE_POINTS = 1000;
+const NEXT_QUESTION_DELAY_MS = 3000;
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -133,6 +134,95 @@ const makeQuestionKey = (gameId: string, questionIndex: number): string =>
 const allPlayersAnswered = (game: Game): boolean =>
   game.players.length > 0 && game.playerAnswers.size >= game.players.length;
 
+const clearGameTimers = (game: Game): void => {
+  if (game.questionTimer) {
+    clearTimeout(game.questionTimer);
+    game.questionTimer = undefined;
+  }
+
+  if (game.transitionTimer) {
+    clearTimeout(game.transitionTimer);
+    game.transitionTimer = undefined;
+  }
+};
+
+const cleanupGame = (gameId: string): void => {
+  const game = gamesById.get(gameId);
+  if (!game) {
+    return;
+  }
+
+  clearGameTimers(game);
+
+  gameIdByCode.delete(game.code);
+
+  if (gameIdByUserId.get(game.hostId) === game.id) {
+    gameIdByUserId.delete(game.hostId);
+  }
+
+  for (const player of game.players) {
+    if (gameIdByUserId.get(player.index) === game.id) {
+      gameIdByUserId.delete(player.index);
+    }
+  }
+
+  for (const key of [...finalizedQuestionKeys]) {
+    if (key.startsWith(`${gameId}:`)) {
+      finalizedQuestionKeys.delete(key);
+    }
+  }
+
+  gamesById.delete(gameId);
+};
+
+const sendQuestion = (game: Game, questionIndex: number): void => {
+  if (game.status !== 'in_progress') {
+    return;
+  }
+
+  const question = game.questions[questionIndex];
+  if (!question) {
+    return;
+  }
+
+  clearGameTimers(game);
+
+  game.currentQuestion = questionIndex;
+  game.playerAnswers.clear();
+  game.questionStartTime = Date.now();
+
+  const questionKey = makeQuestionKey(game.id, questionIndex);
+  finalizedQuestionKeys.delete(questionKey);
+
+  game.questionTimer = setTimeout(() => {
+    finalizeQuestion(game.id, questionIndex);
+  }, question.timeLimitSec * 1000);
+
+  broadcast(game, 'question', {
+    questionNumber: questionIndex + 1,
+    totalQuestions: game.questions.length,
+    text: question.text,
+    options: question.options,
+    timeLimitSec: question.timeLimitSec,
+  });
+};
+
+const finishGame = (game: Game): void => {
+  game.status = 'finished';
+  clearGameTimers(game);
+
+  const scoreboard = [...game.players]
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .map((player, index) => ({
+      name: player.name,
+      score: player.score,
+      rank: index + 1,
+    }));
+
+  broadcast(game, 'game_finished', { scoreboard });
+  cleanupGame(game.id);
+};
+
 const finalizeQuestion = (gameId: string, questionIndex: number): void => {
   const game = gamesById.get(gameId);
   if (!game || game.status !== 'in_progress') {
@@ -143,21 +233,19 @@ const finalizeQuestion = (gameId: string, questionIndex: number): void => {
     return;
   }
 
-  const key = makeQuestionKey(gameId, questionIndex);
-  if (finalizedQuestionKeys.has(key)) {
-    return;
-  }
-  finalizedQuestionKeys.add(key);
-
-  if (game.questionTimer) {
-    clearTimeout(game.questionTimer);
-    game.questionTimer = undefined;
-  }
-
   const question = game.questions[questionIndex];
   if (!question) {
     return;
   }
+
+  const key = makeQuestionKey(gameId, questionIndex);
+  if (finalizedQuestionKeys.has(key)) {
+    return;
+  }
+
+  finalizedQuestionKeys.add(key);
+
+  clearGameTimers(game);
 
   const questionStart = game.questionStartTime ?? Date.now();
   const questionDurationMs = question.timeLimitSec * 1000;
@@ -191,6 +279,21 @@ const finalizeQuestion = (gameId: string, questionIndex: number): void => {
     correctIndex: question.correctIndex,
     playerResults,
   });
+
+  const nextQuestionIndex = questionIndex + 1;
+  if (nextQuestionIndex < game.questions.length) {
+    game.transitionTimer = setTimeout(() => {
+      const activeGame = gamesById.get(game.id);
+      if (!activeGame || activeGame.status !== 'in_progress') {
+        return;
+      }
+
+      sendQuestion(activeGame, nextQuestionIndex);
+    }, NEXT_QUESTION_DELAY_MS);
+    return;
+  }
+
+  finishGame(game);
 };
 
 const generateRoomCode = (): string => {
@@ -510,30 +613,7 @@ const handleStartGame = (ws: WebSocket, data: unknown): void => {
   }
 
   game.status = 'in_progress';
-  game.currentQuestion = 0;
-  game.playerAnswers.clear();
-  game.questionStartTime = Date.now();
-
-  const questionKey = makeQuestionKey(game.id, 0);
-  finalizedQuestionKeys.delete(questionKey);
-
-  if (game.questionTimer) {
-    clearTimeout(game.questionTimer);
-    game.questionTimer = undefined;
-  }
-
-  const firstQuestion = game.questions[0];
-  game.questionTimer = setTimeout(() => {
-    finalizeQuestion(game.id, 0);
-  }, firstQuestion.timeLimitSec * 1000);
-
-  broadcast(game, 'question', {
-    questionNumber: 1,
-    totalQuestions: game.questions.length,
-    text: firstQuestion.text,
-    options: firstQuestion.options,
-    timeLimitSec: firstQuestion.timeLimitSec,
-  });
+  sendQuestion(game, 0);
 };
 
 const handleAnswer = (ws: WebSocket, data: unknown): void => {
