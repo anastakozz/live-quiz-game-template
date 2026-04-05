@@ -726,7 +726,15 @@ const unlinkSocket = (ws: WebSocket): void => {
         message: 'Host disconnected. Game has been closed.',
       });
       cleanupGame(game.id);
+      return;
     }
+
+    if (game.status === 'in_progress') {
+      finishGame(game);
+      return;
+    }
+
+    cleanupGame(game.id);
     return;
   }
 
